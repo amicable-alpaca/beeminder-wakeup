@@ -1,38 +1,49 @@
 #!/usr/bin/env python3
 """
-Checks today's Focusmate datapoints on Beeminder and:
-- Computes today's wake-and-focus outcome (1 if there's at least one >=50-minute
-  Focusmate session that started at or before 09:15 local; else 0).
-- Writes the result to a local SQLite "source of truth" (SoT).
-- RECONCILES Beeminder goal 'wakeandfocus' to match the SoT:
-    * Ensures today's datapoint equals the SoT value.
-    * Removes any duplicates for today if present.
-- Only after reconciliation does it post/update Beeminder as needed.
+Reconcile Beeminder 'wakeandfocus' with a local Source of Truth (SoT)
+computed from Focusmate history.
 
-Requirements:
-  pip install requests
+Logic:
+  1) Download Focusmate datapoints (paginated).
+  2) For each day in the chosen window, compute SoT outcome:
+       1 if there's at least one >=50m Focusmate session that started
+       at/before 09:15 local; else 0.
+  3) Upsert SoT rows for *all* days in the window.
+  4) Reconcile Beeminder 'wakeandfocus' per day:
+       - If none: POST (idempotent via requestid).
+       - If multiple: keep newest, delete extras.
+       - Ensure value & comment match SoT; PUT update if needed.
+  5) Optional purge of extra Beeminder days not in SoT (STRICT_PURGE=1).
 
-Environment variables:
-  BM_USERNAME (default: zarathustra)
-  BM_AUTH_TOKEN (required)
-  DRY_RUN=1 to skip API writes
-  DEBUG=1   to print extra info
+Env:
+  BM_USERNAME   (default: zarathustra)
+  BM_AUTH_TOKEN (required unless DRY_RUN=1)
+  DRY_RUN=1     (no API mutations)
+  DEBUG=1       (extra logs)
+  FULL_HISTORY=1  (use earliest Focusmate dp .. today)
+  HISTORY_DAYS=N  (default 90; ignored if FULL_HISTORY=1)
+  STRICT_PURGE=1  (delete wakeandfocus dps on days not in SoT)
 """
 
 import os
 import re
 import sys
+import math
 import sqlite3
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
+from collections import defaultdict
 
-# --- Config from env ---
+# -------- Config from env --------
 USERNAME = os.getenv("BM_USERNAME", "zarathustra")
 AUTH_TOKEN = os.getenv("BM_AUTH_TOKEN")  # REQUIRED unless DRY_RUN=1
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 DEBUG = os.getenv("DEBUG") == "1"
+FULL_HISTORY = os.getenv("FULL_HISTORY") == "1"
+STRICT_PURGE = os.getenv("STRICT_PURGE") == "1"
+HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "90"))
 
 FOCUSMATE_GOAL = "focusmate"
 WAKEANDFOCUS_GOAL = "wakeandfocus"
@@ -49,7 +60,7 @@ COMMENT_RE = re.compile(
 
 API_BASE = "https://www.beeminder.com/api/v1"
 
-# --- SoT storage ---
+# -------- SoT storage --------
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "wake_focus_sot.db"
@@ -70,65 +81,18 @@ ON CONFLICT(daystamp) DO UPDATE SET
   updated_at=excluded.updated_at;
 """
 
-SELECT_SOT_SQL = "SELECT value FROM records WHERE daystamp=?;"
+SELECT_ALL_SOT_SQL = "SELECT daystamp, value FROM records;"
 
-# --- Helpers ---
-def log_debug(msg):
+# -------- Helpers --------
+def log_debug(msg: str):
     if DEBUG:
         print(f"[DEBUG] {msg}")
 
 def today_daystamp(tz: ZoneInfo) -> str:
     return datetime.now(tz).strftime("%Y%m%d")
 
-def now_iso_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def get_datapoints_for_goal(username: str, goal: str, auth_token: str):
-    if not auth_token and not DRY_RUN:
-        raise RuntimeError("BM_AUTH_TOKEN is not set")
-    url = f"{API_BASE}/users/{username}/goals/{goal}/datapoints.json"
-    params = {"auth_token": auth_token, "per_page": 100, "sort": "desc"}
-    log_debug(f"GET {url} params={params}")
-    if DRY_RUN:
-        return []
-    resp = requests.get(url, params=params, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-def add_datapoint(username: str, goal: str, auth_token: str, value: float, comment: str = "", requestid: str | None = None):
-    if DRY_RUN:
-        log_debug(f"[DRY_RUN] Would POST {goal}: value={value}, comment={comment}")
-        return {}
-    url = f"{API_BASE}/users/{username}/goals/{goal}/datapoints.json"
-    data = {"auth_token": auth_token, "value": value, "comment": comment}
-    if requestid:
-        data["requestid"] = requestid
-    log_debug(f"POST {url} data={data}")
-    resp = requests.post(url, data=data, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-def update_datapoint(username: str, goal: str, auth_token: str, dp_id: str, value: float, comment: str = ""):
-    if DRY_RUN:
-        log_debug(f"[DRY_RUN] Would PUT {goal} dp_id={dp_id}: value={value}, comment={comment}")
-        return {}
-    url = f"{API_BASE}/users/{username}/goals/{goal}/datapoints/{dp_id}.json"
-    data = {"auth_token": auth_token, "value": value, "comment": comment}
-    log_debug(f"PUT {url} data={data}")
-    resp = requests.put(url, data=data, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-def delete_datapoint(username: str, goal: str, auth_token: str, dp_id: str):
-    if DRY_RUN:
-        log_debug(f"[DRY_RUN] Would DELETE {goal} dp_id={dp_id}")
-        return True
-    url = f"{API_BASE}/users/{username}/goals/{goal}/datapoints/{dp_id}.json"
-    params = {"auth_token": auth_token}
-    log_debug(f"DELETE {url} params={params}")
-    resp = requests.delete(url, params=params, timeout=20)
-    resp.raise_for_status()
-    return True
+def daystamp_of(dt: datetime, tz: ZoneInfo) -> str:
+    return dt.astimezone(tz).strftime("%Y%m%d")
 
 def parse_comment_for_length_and_time(comment: str):
     m = COMMENT_RE.search(comment or "")
@@ -144,22 +108,113 @@ def parse_comment_for_length_and_time(comment: str):
 def qualifies_time(hour: int, minute: int) -> bool:
     return (hour < CUTOFF_HOUR) or (hour == CUTOFF_HOUR and minute <= CUTOFF_MINUTE)
 
-def compute_today_outcome() -> int:
-    today = today_daystamp(LOCAL_TZ)
-    dps = get_datapoints_for_goal(USERNAME, FOCUSMATE_GOAL, AUTH_TOKEN)
-    todays = [dp for dp in dps if dp.get("daystamp") == today]
-    log_debug(f"Found {len(todays)} Focusmate datapoints for today.")
+def now_iso_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    for dp in todays:
-        parsed = parse_comment_for_length_and_time(dp.get("comment", ""))
-        if not parsed:
-            continue
-        minutes, hour, minute = parsed
-        if minutes >= MIN_SESSION_MINUTES and qualifies_time(hour, minute):
-            log_debug(f"Qualifying session found: {minutes} min at {hour}:{minute:02d}")
-            return 1
-    return 0
+# -------- API helpers (with pagination) --------
+def _need_auth():
+    if not AUTH_TOKEN and not DRY_RUN:
+        raise RuntimeError("BM_AUTH_TOKEN is not set")
 
+def fetch_all_datapoints(username: str, goal: str) -> list[dict]:
+    """Return *all* datapoints for a goal (paginated)."""
+    _need_auth()
+    if DRY_RUN:
+        log_debug(f"[DRY_RUN] Would fetch all datapoints for {goal}")
+        return []
+
+    results = []
+    page = 1
+    per_page = 100
+    while True:
+        url = f"{API_BASE}/users/{username}/goals/{goal}/datapoints.json"
+        params = {"auth_token": AUTH_TOKEN, "sort": "desc", "page": page, "per_page": per_page}
+        log_debug(f"GET {url} page={page}")
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        results.extend(batch)
+        if len(batch) < per_page:
+            break
+        page += 1
+    log_debug(f"Fetched {len(results)} datapoints for {goal}")
+    return results
+
+def add_datapoint(goal: str, value: float, comment: str, requestid: str | None = None):
+    if DRY_RUN:
+        log_debug(f"[DRY_RUN] Would POST {goal}: value={value}, comment={comment}, requestid={requestid}")
+        return {}
+    url = f"{API_BASE}/users/{USERNAME}/goals/{goal}/datapoints.json"
+    data = {"auth_token": AUTH_TOKEN, "value": value, "comment": comment}
+    if requestid:
+        data["requestid"] = requestid
+    resp = requests.post(url, data=data, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def update_datapoint(goal: str, dp_id: str, value: float, comment: str):
+    if DRY_RUN:
+        log_debug(f"[DRY_RUN] Would PUT {goal} dp_id={dp_id}: value={value}, comment={comment}")
+        return {}
+    url = f"{API_BASE}/users/{USERNAME}/goals/{goal}/datapoints/{dp_id}.json"
+    data = {"auth_token": AUTH_TOKEN, "value": value, "comment": comment}
+    resp = requests.put(url, data=data, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+def delete_datapoint(goal: str, dp_id: str):
+    if DRY_RUN:
+        log_debug(f"[DRY_RUN] Would DELETE {goal} dp_id={dp_id}")
+        return True
+    url = f"{API_BASE}/users/{USERNAME}/goals/{goal}/datapoints/{dp_id}.json"
+    params = {"auth_token": AUTH_TOKEN}
+    resp = requests.delete(url, params=params, timeout=30)
+    resp.raise_for_status()
+    return True
+
+# -------- SoT compute over a date range --------
+def daterange(start: date, end: date):
+    """Inclusive range of dates from start to end."""
+    cur = start
+    while cur <= end:
+        yield cur
+        cur = cur + timedelta(days=1)
+
+def compute_sot_for_range(focusmate_dps: list[dict], start_date: date, end_date: date) -> dict[str, int]:
+    """
+    Return dict[daystamp] -> 0/1 for the requested date range.
+    Uses Focusmate comments to decide if the day qualifies.
+    """
+    # Bucket focusmate dps by daystamp (local)
+    by_day: dict[str, list[dict]] = defaultdict(list)
+    for dp in focusmate_dps:
+        # Beeminder returns unix 'timestamp' seconds; prefer daystamp if present
+        ds = dp.get("daystamp")
+        if not ds:
+            ts = dp.get("timestamp")
+            if ts is None:
+                continue
+            ds = daystamp_of(datetime.fromtimestamp(ts, tz=timezone.utc), LOCAL_TZ)
+        by_day[ds].append(dp)
+
+    out: dict[str, int] = {}
+    for d in daterange(start_date, end_date):
+        ds = d.strftime("%Y%m%d")
+        val = 0
+        for dp in by_day.get(ds, []):
+            parsed = parse_comment_for_length_and_time(dp.get("comment", ""))
+            if not parsed:
+                continue
+            minutes, hour, minute = parsed
+            if minutes >= MIN_SESSION_MINUTES and qualifies_time(hour, minute):
+                val = 1
+                break
+        out[ds] = val
+    return out
+
+# -------- SQLite helpers --------
 def sot_open():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -167,51 +222,104 @@ def sot_open():
     conn.commit()
     return conn
 
-def sot_get(conn: sqlite3.Connection, daystamp: str) -> int | None:
-    cur = conn.execute(SELECT_SOT_SQL, (daystamp,))
-    row = cur.fetchone()
-    return int(row[0]) if row else None
+def sot_upsert_bulk(conn: sqlite3.Connection, mapping: dict[str, int]):
+    now = now_iso_utc()
+    with conn:
+        for ds, v in mapping.items():
+            conn.execute(UPSERT_SOT_SQL, (ds, int(v), now))
 
-def sot_set(conn: sqlite3.Connection, daystamp: str, value: int):
-    log_debug(f"Setting SoT for {daystamp} to {value}")
-    conn.execute(UPSERT_SOT_SQL, (daystamp, int(value), now_iso_utc()))
-    conn.commit()
+def sot_load_all(conn: sqlite3.Connection) -> dict[str, int]:
+    cur = conn.execute(SELECT_ALL_SOT_SQL)
+    return {row[0]: int(row[1]) for row in cur.fetchall()}
 
-def reconcile_beeminder_with_sot(daystamp: str, sot_value: int):
-    dps = get_datapoints_for_goal(USERNAME, WAKEANDFOCUS_GOAL, AUTH_TOKEN)
-    todays = [dp for dp in dps if dp.get("daystamp") == daystamp]
+# -------- Reconciliation across history --------
+def reconcile_history(sot_map: dict[str, int]):
+    """Bring wakeandfocus dps in line with SoT for all days in sot_map."""
+    wf_all = fetch_all_datapoints(USERNAME, WAKEANDFOCUS_GOAL)
 
-    todays.sort(key=lambda dp: (dp.get("updated_at") or dp.get("timestamp") or 0), reverse=True)
-    comment_ok = f"Auto: SoT={sot_value} for {daystamp} (≥50m by 09:15 check)."
+    # Group existing wakeandfocus by daystamp
+    wf_by_day: dict[str, list[dict]] = defaultdict(list)
+    for dp in wf_all:
+        ds = dp.get("daystamp")
+        if not ds:
+            ts = dp.get("timestamp")
+            if ts is None:  # shouldn't happen
+                continue
+            ds = daystamp_of(datetime.fromtimestamp(ts, tz=timezone.utc), LOCAL_TZ)
+        wf_by_day[ds].append(dp)
 
-    if not todays:
-        requestid = f"{WAKEANDFOCUS_GOAL}-{daystamp}-sot-v1"
-        add_datapoint(USERNAME, WAKEANDFOCUS_GOAL, AUTH_TOKEN, sot_value, comment_ok, requestid=requestid)
-        return
+    # 1) For each SoT day: ensure exactly one dp with matching value+comment
+    for ds, sot_val in sorted(sot_map.items()):
+        comment_ok = f"Auto: SoT={sot_val} for {ds} (≥50m by 09:15 check)."
+        existing = sorted(
+            wf_by_day.get(ds, []),
+            key=lambda dp: (dp.get("updated_at") or dp.get("timestamp") or 0),
+            reverse=True,
+        )
 
-    keeper = todays[0]
-    extras = todays[1:]
-    for dp in extras:
-        delete_datapoint(USERNAME, WAKEANDFOCUS_GOAL, AUTH_TOKEN, dp["id"])
+        if not existing:
+            reqid = f"{WAKEANDFOCUS_GOAL}-{ds}-sot-v1"
+            log_debug(f"[{ds}] Missing on Beeminder → POST {sot_val}")
+            add_datapoint(WAKEANDFOCUS_GOAL, sot_val, comment_ok, requestid=reqid)
+            continue
 
-    try:
-        keeper_value = float(keeper.get("value", 0))
-    except Exception:
-        keeper_value = 0.0
+        keeper = existing[0]
+        extras = existing[1:]
+        # delete extras
+        for dp in extras:
+            log_debug(f"[{ds}] Deleting duplicate dp {dp.get('id')}")
+            delete_datapoint(WAKEANDFOCUS_GOAL, dp["id"])
 
-    if int(round(keeper_value)) != int(sot_value):
-        update_datapoint(USERNAME, WAKEANDFOCUS_GOAL, AUTH_TOKEN, keeper["id"], sot_value, comment_ok)
-    else:
-        if (keeper.get("comment") or "") != comment_ok:
-            update_datapoint(USERNAME, WAKEANDFOCUS_GOAL, AUTH_TOKEN, keeper["id"], sot_value, comment_ok)
+        # ensure keeper matches SoT
+        try:
+            keeper_value = float(keeper.get("value", 0))
+        except Exception:
+            keeper_value = 0.0
 
+        if int(round(keeper_value)) != int(sot_val) or (keeper.get("comment") or "") != comment_ok:
+            log_debug(f"[{ds}] Updating keeper {keeper.get('id')} -> {sot_val}")
+            update_datapoint(WAKEANDFOCUS_GOAL, keeper["id"], sot_val, comment_ok)
+
+    # 2) Optional purge: remove wakeandfocus dps on days not in SoT
+    if STRICT_PURGE:
+        sot_days = set(sot_map.keys())
+        for ds, dps in wf_by_day.items():
+            if ds not in sot_days:
+                for dp in dps:
+                    log_debug(f"[{ds}] STRICT_PURGE delete dp {dp.get('id')}")
+                    delete_datapoint(WAKEANDFOCUS_GOAL, dp["id"])
+
+# -------- Main --------
 def main():
     try:
-        daystamp = today_daystamp(LOCAL_TZ)
-        outcome = compute_today_outcome()
+        # Determine range
+        if FULL_HISTORY:
+            fm_all = fetch_all_datapoints(USERNAME, FOCUSMATE_GOAL)
+            if fm_all:
+                # compute from earliest fm dp to today (local)
+                earliest_ts = min(dp.get("timestamp") or 0 for dp in fm_all) or 0
+                start_date = datetime.fromtimestamp(earliest_ts, tz=timezone.utc).astimezone(LOCAL_TZ).date()
+            else:
+                # no focusmate data; just today
+                start_date = datetime.now(LOCAL_TZ).date()
+            end_date = datetime.now(LOCAL_TZ).date()
+            log_debug(f"Range FULL_HISTORY: {start_date} .. {end_date}")
+            sot_map = compute_sot_for_range(fm_all, start_date, end_date)
+        else:
+            # limited window (default 90 days)
+            end_date = datetime.now(LOCAL_TZ).date()
+            start_date = end_date - timedelta(days=HISTORY_DAYS - 1)
+            log_debug(f"Range LAST {HISTORY_DAYS} DAYS: {start_date} .. {end_date}")
+            fm_all = fetch_all_datapoints(USERNAME, FOCUSMATE_GOAL)
+            sot_map = compute_sot_for_range(fm_all, start_date, end_date)
+
+        # Upsert SoT to DB
         conn = sot_open()
-        sot_set(conn, daystamp, outcome)
-        reconcile_beeminder_with_sot(daystamp, outcome)
+        sot_upsert_bulk(conn, sot_map)
+
+        # Reconcile across history
+        reconcile_history(sot_map)
+
     except requests.HTTPError as e:
         sys.stderr.write(f"HTTP error: {e} — {e.response.text if e.response else ''}\n")
         sys.exit(1)
