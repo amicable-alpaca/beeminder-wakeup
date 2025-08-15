@@ -2,20 +2,32 @@ name: Wake & Focus (daily 11am NY)
 
 on:
   schedule:
-    - cron: "0 15 * * *"   # daily at 11:00 America/New_York (gated in job)
+    - cron: "0 15 * * *"   # fires 15:00 UTC daily
   workflow_dispatch:
     inputs:
       DRY_RUN:
-        description: "Set to 1 for no API writes"
+        description: "1 = no API writes"
         required: false
         default: "0"
       DEBUG:
-        description: "Set to 1 for verbose logs"
+        description: "1 = verbose logs"
         required: false
         default: "0"
+      FULL_HISTORY:
+        description: "1 = reconcile from earliest Focusmate dp to today"
+        required: false
+        default: "0"
+      STRICT_PURGE:
+        description: "1 = delete wakeandfocus dps on days not in SoT"
+        required: false
+        default: "0"
+      HISTORY_DAYS:
+        description: "Days to reconcile when FULL_HISTORY=0"
+        required: false
+        default: "90"
 
 permissions:
-  contents: write
+  contents: write  # needed to push the SQLite SoT DB
 
 jobs:
   run:
@@ -24,6 +36,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # For scheduled runs only, ensure we act at 11:00 America/New_York year-round
       - name: Gate by America/New_York 11:00 only (skip for manual runs)
         if: ${{ github.event_name == 'schedule' }}
         run: |
@@ -46,8 +59,11 @@ jobs:
         env:
           BM_USERNAME: ${{ secrets.BM_USERNAME }}
           BM_AUTH_TOKEN: ${{ secrets.BM_AUTH_TOKEN }}
-          DRY_RUN: ${{ inputs.DRY_RUN || '0' }}
-          DEBUG: ${{ inputs.DEBUG || '0' }}
+          DRY_RUN:       ${{ inputs.DRY_RUN       || '0' }}
+          DEBUG:         ${{ inputs.DEBUG         || '0' }}
+          FULL_HISTORY:  ${{ inputs.FULL_HISTORY  || '0' }}
+          STRICT_PURGE:  ${{ inputs.STRICT_PURGE  || '0' }}
+          HISTORY_DAYS:  ${{ inputs.HISTORY_DAYS  || '90' }}
         run: python scripts/wake_focus_sync.py
 
       - name: Commit & push SoT DB
@@ -62,4 +78,3 @@ jobs:
             git commit -m "chore: update SoT DB for wake & focus"
             git push
           fi
-
