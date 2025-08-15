@@ -2,13 +2,20 @@ name: Wake & Focus (daily 11am NY)
 
 on:
   schedule:
-    # Runs at 15:00 UTC daily.
-    # NOTE: 11:00 in New York while on EDT (UTC-4), but 10:00 in New York during EST (UTC-5).
-    - cron: "0 15 * * *"
-  workflow_dispatch: {}
+    - cron: "0 15 * * *"   # daily at 11:00 America/New_York (gated in job)
+  workflow_dispatch:
+    inputs:
+      DRY_RUN:
+        description: "Set to 1 for no API writes"
+        required: false
+        default: "0"
+      DEBUG:
+        description: "Set to 1 for verbose logs"
+        required: false
+        default: "0"
 
 permissions:
-  contents: write   # needed to push the SoT DB back to the repo
+  contents: write
 
 jobs:
   run:
@@ -17,9 +24,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Optional guard: ensure it's actually 11:00 in America/New_York
-      # even when DST flips. This step exits early unless local hour==11.
-      - name: Gate by America/New_York 11:00 only
+      - name: Gate by America/New_York 11:00 only (skip for manual runs)
+        if: ${{ github.event_name == 'schedule' }}
         run: |
           sudo ln -snf /usr/share/zoneinfo/America/New_York /etc/localtime
           HOUR=$(date +'%H')
@@ -40,9 +46,10 @@ jobs:
         env:
           BM_USERNAME: ${{ secrets.BM_USERNAME }}
           BM_AUTH_TOKEN: ${{ secrets.BM_AUTH_TOKEN }}
+          DRY_RUN: ${{ inputs.DRY_RUN || '0' }}
+          DEBUG: ${{ inputs.DEBUG || '0' }}
         run: python scripts/wake_focus_sync.py
 
-      # Commit the SoT database if it changed
       - name: Commit & push SoT DB
         run: |
           git config user.name "github-actions[bot]"
@@ -51,6 +58,6 @@ jobs:
           if ! git diff --cached --quiet; then
             git commit -m "chore: update SoT DB for wake & focus"
             git push
-          else
+          else:
             echo "No SoT changes to commit."
           fi
