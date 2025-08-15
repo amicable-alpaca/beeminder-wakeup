@@ -52,12 +52,14 @@ jobs:
 
       - name: Commit & push SoT DB
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/wake_focus_sot.db
-          if ! git diff --cached --quiet; then
+          if git diff --cached --quiet; then
+            echo "No SoT changes to commit."
+          else
             git commit -m "chore: update SoT DB for wake & focus"
             git push
-          else:
-            echo "No SoT changes to commit."
           fi
+
