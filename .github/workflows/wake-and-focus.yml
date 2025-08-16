@@ -30,8 +30,9 @@ on:
 permissions:
   contents: write
 
+# Use ref_name only so the 15:00 and 15:05 runs don't collide
 concurrency:
-  group: wake-and-focus-${{ github.ref_name }}-${{ github.run_id }}
+  group: wake-and-focus-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -45,12 +46,13 @@ jobs:
         run: |
           echo "event: ${{ github.event_name }}"
           echo "cron:  ${{ github.event.schedule }}"
-          echo "UTC now: $(date -u +'%Y-%m-%d %H:%M:%S %Z')"
+          echo "Runner TZ before: $(date +'%Z')"
           sudo ln -snf /usr/share/zoneinfo/America/New_York /etc/localtime
+          echo "UTC now: $(date -u +'%Y-%m-%d %H:%M:%S %Z')"
           echo "NYC now: $(date +'%Y-%m-%d %H:%M:%S %Z')"
 
       # Gate: only act at ~11:00 America/New_York (allow up to :10 for jitter)
-        # Skipped for manual runs so you can test anytime
+      # Skipped for manual runs so you can test anytime
       - name: Gate by America/New_York 11:00 window (skip for manual)
         if: ${{ github.event_name == 'schedule' }}
         run: |
@@ -70,19 +72,22 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Check required secrets
+        env:
+          BM_USERNAME:   ${{ secrets.BM_USERNAME }}
+          BM_AUTH_TOKEN: ${{ secrets.BM_AUTH_TOKEN }}
         run: |
-          : "${{ secrets.BM_USERNAME?Missing secret BM_USERNAME }}"
-          : "${{ secrets.BM_AUTH_TOKEN?Missing secret BM_AUTH_TOKEN }}"
+          : "${BM_USERNAME?Missing secret BM_USERNAME}"
+          : "${BM_AUTH_TOKEN?Missing secret BM_AUTH_TOKEN}"
 
       - name: Run wake & focus sync
         env:
           BM_USERNAME:    ${{ secrets.BM_USERNAME }}
           BM_AUTH_TOKEN:  ${{ secrets.BM_AUTH_TOKEN }}
-          DRY_RUN:        ${{ inputs.DRY_RUN       || '0' }}
-          DEBUG:          ${{ inputs.DEBUG         || '0' }}
-          FULL_HISTORY:   ${{ inputs.FULL_HISTORY  || '0' }}
-          STRICT_PURGE:   ${{ inputs.STRICT_PURGE  || '0' }}
-          HISTORY_DAYS:   ${{ inputs.HISTORY_DAYS  || '90' }}
+          DRY_RUN:        ${{ inputs.DRY_RUN || '0' }}
+          DEBUG:          ${{ inputs.DEBUG || '0' }}
+          FULL_HISTORY:   ${{ inputs.FULL_HISTORY || '0' }}
+          STRICT_PURGE:   ${{ inputs.STRICT_PURGE || '0' }}
+          HISTORY_DAYS:   ${{ inputs.HISTORY_DAYS || '90' }}
         run: python scripts/wake_focus_sync.py
 
       - name: Commit & push SoT DB
@@ -90,7 +95,7 @@ jobs:
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/wake_focus_sot.db
+          git add data/wake_focus_sot.db || true
           if git diff --cached --quiet; then
             echo "No SoT changes to commit."
           else
