@@ -175,6 +175,16 @@ def add_datapoint(goal: str, value: float, comment: str, *, daystamp: str, reque
     if requestid:
         data["requestid"] = requestid
     resp = requests.post(url, data=data, timeout=30)
+    # Beeminder returns 422 "Duplicate request" if the same requestid is
+    # submitted multiple times. That is normal if we race with another run of
+    # this script. Treat that specific error as success so the script remains
+    # idempotent.
+    if resp.status_code == 422 and "Duplicate request" in resp.text:
+        log_debug(f"POST {goal} {daystamp} duplicate request; treating as success")
+        try:
+            return resp.json()
+        except Exception:
+            return {}
     try:
         resp.raise_for_status()
     except requests.HTTPError as e:
