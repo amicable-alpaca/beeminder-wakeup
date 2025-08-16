@@ -2,7 +2,8 @@ name: Wake & Focus (daily 11am NY)
 
 on:
   schedule:
-    - cron: "0 15 * * *"   # fires 15:00 UTC daily
+    # Run at 15:00 and 15:05 UTC to absorb jitter; gate below keeps behavior exact
+    - cron: "0,5 15 * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -27,7 +28,11 @@ on:
         default: "90"
 
 permissions:
-  contents: write  # needed to push the SQLite SoT DB
+  contents: write
+
+concurrency:
+  group: wake-and-focus-${{ github.ref_name }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -36,14 +41,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # For scheduled runs only, ensure we act at 11:00 America/New_York year-round
-      - name: Gate by America/New_York 11:00 only (skip for manual runs)
+      - name: Heartbeat (show actual times)
+        run: |
+          echo "event: ${{ github.event_name }}"
+          echo "cron:  ${{ github.event.schedule }}"
+          echo "UTC now: $(date -u +'%Y-%m-%d %H:%M:%S %Z')"
+          sudo ln -snf /usr/share/zoneinfo/America/New_York /etc/localtime
+          echo "NYC now: $(date +'%Y-%m-%d %H:%M:%S %Z')"
+
+      # Gate: only act at ~11:00 America/New_York (allow up to :10 for jitter)
+        # Skipped for manual runs so you can test anytime
+      - name: Gate by America/New_York 11:00 window (skip for manual)
         if: ${{ github.event_name == 'schedule' }}
         run: |
-          sudo ln -snf /usr/share/zoneinfo/America/New_York /etc/localtime
           HOUR=$(date +'%H')
-          if [ "$HOUR" != "11" ]; then
-            echo "Not 11:00 in America/New_York; exiting."
+          MIN=$(date +'%M')
+          if [ "$HOUR" != "11" ] || [ "$MIN" -gt "10" ]; then
+            echo "Not in 11:00–11:10 America/New_York window; exiting."
             exit 0
           fi
 
@@ -55,15 +69,20 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      - name: Check required secrets
+        run: |
+          : "${{ secrets.BM_USERNAME?Missing secret BM_USERNAME }}"
+          : "${{ secrets.BM_AUTH_TOKEN?Missing secret BM_AUTH_TOKEN }}"
+
       - name: Run wake & focus sync
         env:
-          BM_USERNAME: ${{ secrets.BM_USERNAME }}
-          BM_AUTH_TOKEN: ${{ secrets.BM_AUTH_TOKEN }}
-          DRY_RUN:       ${{ inputs.DRY_RUN       || '0' }}
-          DEBUG:         ${{ inputs.DEBUG         || '0' }}
-          FULL_HISTORY:  ${{ inputs.FULL_HISTORY  || '0' }}
-          STRICT_PURGE:  ${{ inputs.STRICT_PURGE  || '0' }}
-          HISTORY_DAYS:  ${{ inputs.HISTORY_DAYS  || '90' }}
+          BM_USERNAME:    ${{ secrets.BM_USERNAME }}
+          BM_AUTH_TOKEN:  ${{ secrets.BM_AUTH_TOKEN }}
+          DRY_RUN:        ${{ inputs.DRY_RUN       || '0' }}
+          DEBUG:          ${{ inputs.DEBUG         || '0' }}
+          FULL_HISTORY:   ${{ inputs.FULL_HISTORY  || '0' }}
+          STRICT_PURGE:   ${{ inputs.STRICT_PURGE  || '0' }}
+          HISTORY_DAYS:   ${{ inputs.HISTORY_DAYS  || '90' }}
         run: python scripts/wake_focus_sync.py
 
       - name: Commit & push SoT DB
