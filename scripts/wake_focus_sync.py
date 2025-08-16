@@ -5,24 +5,24 @@ computed from Focusmate history.
 
 Logic:
   1) Download Focusmate datapoints (paginated).
-  2) For each day in the chosen window, compute SoT outcome:
-       1 if there's at least one >=50m Focusmate session that started
-       at/before 09:15 local; else 0.
-  3) Upsert SoT rows for *all* days in the window.
+  2) For the chosen window, build the SoT from days with a qualifying
+     Focusmate session (>=50m that started at/before 09:15 local).
+  3) Persist SoT rows only for qualifying days (value=1) and drop any others
+     from the local DB.
   4) Reconcile Beeminder 'wakeandfocus' per day:
        - If none: POST (idempotent via requestid) **with daystamp**.
        - If multiple: keep newest, delete extras.
        - Ensure value & comment match SoT; PUT update (with daystamp) if needed.
-  5) Optional purge of extra Beeminder days not in SoT (STRICT_PURGE=1).
+  5) Purge wakeandfocus datapoints not present in the SoT (STRICT_PURGE=1).
 
 Env:
   BM_USERNAME   (default: zarathustra)
   BM_AUTH_TOKEN (required unless DRY_RUN=1)
   DRY_RUN=1     (no API mutations)
   DEBUG=1       (extra logs)
-  FULL_HISTORY=1  (use earliest Focusmate dp .. today)
-  HISTORY_DAYS=N  (default 90; ignored if FULL_HISTORY=1)
-  STRICT_PURGE=1  (delete wakeandfocus dps on days not in SoT)
+  FULL_HISTORY=1  (default; set to 0 to limit to recent history)
+  HISTORY_DAYS=N  (default 90; used only if FULL_HISTORY=0)
+  STRICT_PURGE=1  (default; delete wakeandfocus dps on days not in SoT)
 """
 
 import os
@@ -41,8 +41,8 @@ USERNAME = os.getenv("BM_USERNAME", "zarathustra")
 AUTH_TOKEN = os.getenv("BM_AUTH_TOKEN")  # REQUIRED unless DRY_RUN=1
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 DEBUG = os.getenv("DEBUG") == "1"
-FULL_HISTORY = os.getenv("FULL_HISTORY") == "1"
-STRICT_PURGE = os.getenv("STRICT_PURGE") == "1"
+FULL_HISTORY = os.getenv("FULL_HISTORY", "1") == "1"
+STRICT_PURGE = os.getenv("STRICT_PURGE", "1") == "1"
 HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "90"))
 
 FOCUSMATE_GOAL = "focusmate"
@@ -227,11 +227,10 @@ def daterange(start: date, end: date):
         yield cur
         cur = cur + timedelta(days=1)
 
-def compute_sot_for_range(focusmate_dps: list[dict], start_date: date, end_date: date) -> dict[str, int]:
-    """
-    Return dict[daystamp] -> 0/1 for the requested date range.
-    Uses Focusmate comments to decide if the day qualifies.
-    """
+def compute_sot_for_range(
+    focusmate_dps: list[dict], start_date: date, end_date: date
+) -> dict[str, int]:
+    """Return {daystamp: 1} for days with a qualifying Focusmate session."""
     # Bucket focusmate dps by daystamp (local)
     by_day: dict[str, list[dict]] = defaultdict(list)
     for dp in focusmate_dps:
@@ -246,16 +245,14 @@ def compute_sot_for_range(focusmate_dps: list[dict], start_date: date, end_date:
     out: dict[str, int] = {}
     for d in daterange(start_date, end_date):
         ds = d.strftime("%Y%m%d")
-        val = 0
         for dp in by_day.get(ds, []):
             parsed = parse_comment_for_length_and_time(dp.get("comment", ""))
             if not parsed:
                 continue
             minutes, hour, minute = parsed
             if minutes >= MIN_SESSION_MINUTES and qualifies_time(hour, minute):
-                val = 1
+                out[ds] = 1
                 break
-        out[ds] = val
     return out
 
 # -------- SQLite helpers --------
@@ -266,11 +263,19 @@ def sot_open():
     conn.commit()
     return conn
 
-def sot_upsert_bulk(conn: sqlite3.Connection, mapping: dict[str, int]):
+def sot_replace_all(conn: sqlite3.Connection, mapping: dict[str, int]):
+    """Replace DB contents with mapping (only 1s)."""
     now = now_iso_utc()
+    keys = set(mapping.keys())
     with conn:
-        for ds, v in mapping.items():
-            conn.execute(UPSERT_SOT_SQL, (ds, int(v), now))
+        existing = {row[0] for row in conn.execute("SELECT daystamp FROM records")}
+        to_delete = existing - keys
+        if to_delete:
+            conn.executemany(
+                "DELETE FROM records WHERE daystamp=?", [(ds,) for ds in to_delete]
+            )
+        for ds in keys:
+            conn.execute(UPSERT_SOT_SQL, (ds, 1, now))
 
 def sot_load_all(conn: sqlite3.Connection) -> dict[str, int]:
     cur = conn.execute(SELECT_ALL_SOT_SQL)
@@ -368,9 +373,9 @@ def main():
         # Build SoT over the chosen range
         sot_map = compute_sot_for_range(fm_all, start_date, end_date)
 
-        # Upsert SoT to DB
+        # Replace SoT in DB with current mapping
         conn = sot_open()
-        sot_upsert_bulk(conn, sot_map)
+        sot_replace_all(conn, sot_map)
 
         # Reconcile across history
         reconcile_history(sot_map)
