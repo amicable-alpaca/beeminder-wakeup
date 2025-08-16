@@ -50,6 +50,8 @@ WAKEANDFOCUS_GOAL = "wakeandfocus"
 
 LOCAL_TZ = ZoneInfo("America/New_York")
 MIN_SESSION_MINUTES = 50
+EARLIEST_HOUR = 6
+EARLIEST_MINUTE = 0
 CUTOFF_HOUR = 9
 CUTOFF_MINUTE = 15  # inclusive
 
@@ -103,7 +105,10 @@ def parse_comment_for_length_and_time(comment: Optional[str]):
     return minutes, hour, minute
 
 def qualifies_time(hour: int, minute: int) -> bool:
-    return (hour < CUTOFF_HOUR) or (hour == CUTOFF_HOUR and minute <= CUTOFF_MINUTE)
+    return (
+        (hour > EARLIEST_HOUR or (hour == EARLIEST_HOUR and minute >= EARLIEST_MINUTE))
+        and ((hour < CUTOFF_HOUR) or (hour == CUTOFF_HOUR and minute <= CUTOFF_MINUTE))
+    )
 
 def now_iso_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
