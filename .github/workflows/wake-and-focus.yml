@@ -21,7 +21,7 @@ on:
       STRICT_PURGE:
         description: "1 = delete wakeandfocus dps on days not in SoT"
         required: false
-        default: "0"
+        default: "1"
       HISTORY_DAYS:
         description: "Days to reconcile when FULL_HISTORY=0"
         required: false
@@ -86,7 +86,7 @@ jobs:
           DRY_RUN:        ${{ inputs.DRY_RUN || '0' }}
           DEBUG:          ${{ inputs.DEBUG || '0' }}
           FULL_HISTORY:   ${{ inputs.FULL_HISTORY || '0' }}
-          STRICT_PURGE:   ${{ inputs.STRICT_PURGE || '0' }}
+          STRICT_PURGE:   ${{ inputs.STRICT_PURGE || '1' }}
           HISTORY_DAYS:   ${{ inputs.HISTORY_DAYS || '90' }}
         run: python scripts/wake_focus_sync.py
 
