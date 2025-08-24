@@ -141,7 +141,7 @@ def fetch_all_datapoints(username: str, goal: str) -> list[dict]:
 
     results = []
     page = 1
-    per_page = 100
+    per_page = 25
     while True:
         url = f"{API_BASE}/users/{username}/goals/{goal}/datapoints.json"
         params = {"auth_token": AUTH_TOKEN, "sort": "desc", "page": page, "per_page": per_page}
