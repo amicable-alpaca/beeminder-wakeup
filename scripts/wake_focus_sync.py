@@ -56,7 +56,7 @@ CUTOFF_HOUR = 9
 CUTOFF_MINUTE = 15  # inclusive
 
 COMMENT_RE = re.compile(
-    r"^\s*(\d+)\s*minutes?\s+session\s+at\s+(\d{1,2}):(\d{2})\b",
+    r"(\d+)\s*(?:minutes?|mins?|m)\b.*?(?:session|started|at)\s+(?:at\s+)?(\d{1,2}):(\d{2})\b",
     re.IGNORECASE,
 )
 
