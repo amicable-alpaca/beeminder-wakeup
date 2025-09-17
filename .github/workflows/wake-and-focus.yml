@@ -1,9 +1,9 @@
 name: Wake & Focus (daily 11am NY)
 
-# on:
-  # schedule:
+on:
+  schedule:
     # Run at 15:00 and 15:05 UTC to absorb jitter; gate below keeps behavior exact
-    # - cron: "0,5 15 * * *"
+    - cron: "0,5 15 * * *"
   workflow_dispatch:
     inputs:
       DRY_RUN:
@@ -17,11 +17,11 @@ name: Wake & Focus (daily 11am NY)
       FULL_HISTORY:
         description: "1 = reconcile from earliest Focusmate dp to today"
         required: false
-        default: "0"
+        default: "1"
       STRICT_PURGE:
         description: "1 = delete wakeandfocus dps on days not in SoT"
         required: false
-        default: "1"
+        default: "0"
       HISTORY_DAYS:
         description: "Days to reconcile when FULL_HISTORY=0"
         required: false
@@ -85,8 +85,8 @@ jobs:
           BM_AUTH_TOKEN:  ${{ secrets.BM_AUTH_TOKEN }}
           DRY_RUN:        ${{ inputs.DRY_RUN || '0' }}
           DEBUG:          ${{ inputs.DEBUG || '0' }}
-          FULL_HISTORY:   ${{ inputs.FULL_HISTORY || '0' }}
-          STRICT_PURGE:   ${{ inputs.STRICT_PURGE || '1' }}
+          FULL_HISTORY:   ${{ inputs.FULL_HISTORY || '1' }}
+          STRICT_PURGE:   ${{ inputs.STRICT_PURGE || '0' }}
           HISTORY_DAYS:   ${{ inputs.HISTORY_DAYS || '90' }}
         run: python scripts/wake_focus_sync.py
 

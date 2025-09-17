@@ -22,7 +22,7 @@ Env:
   DEBUG=1       (extra logs)
   FULL_HISTORY=1  (default; set to 0 to limit to recent history)
   HISTORY_DAYS=N  (default 90; used only if FULL_HISTORY=0)
-  STRICT_PURGE=1  (default; delete wakeandfocus dps on days not in SoT)
+  STRICT_PURGE=1  (delete wakeandfocus dps on days not in SoT; default: 0 for safety)
 """
 
 import os
@@ -42,7 +42,7 @@ AUTH_TOKEN = os.getenv("BM_AUTH_TOKEN")  # REQUIRED unless DRY_RUN=1
 DRY_RUN = os.getenv("DRY_RUN") == "1"
 DEBUG = os.getenv("DEBUG") == "1"
 FULL_HISTORY = os.getenv("FULL_HISTORY", "1") == "1"
-STRICT_PURGE = os.getenv("STRICT_PURGE", "1") == "1"
+STRICT_PURGE = os.getenv("STRICT_PURGE", "0") == "1"
 HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "90"))
 
 FOCUSMATE_GOAL = "focusmate"
@@ -339,6 +339,20 @@ def reconcile_history(sot_map: dict[str, int]):
     # 2) Optional purge: remove wakeandfocus dps on days not in SoT
     if STRICT_PURGE:
         sot_days = set(sot_map.keys())
+        # Count deletions first for safety
+        deletion_count = 0
+        for ds, dps in wf_by_day.items():
+            if ds not in sot_days:
+                deletion_count += len([dp for dp in dps if dp.get("id")])
+
+        if deletion_count > 10:
+            print(f"WARNING: STRICT_PURGE would delete {deletion_count} datapoints!")
+            print("This seems like a lot. Consider running with STRICT_PURGE=0 first.")
+            if not DRY_RUN:
+                print("Aborting to prevent accidental mass deletion.")
+                return
+
+        log_debug(f"STRICT_PURGE: deleting {deletion_count} datapoints not in SoT")
         for ds, dps in wf_by_day.items():
             if ds not in sot_days:
                 for dp in dps:
