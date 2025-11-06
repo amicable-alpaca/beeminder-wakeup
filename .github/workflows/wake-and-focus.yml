@@ -1,10 +1,10 @@
 name: Wake & Focus (daily 11am NY)
 
-on:
-  schedule:
-    # Run at 15:00 and 15:05 UTC to absorb jitter; gate below keeps behavior exact
-    - cron: "0,5 15 * * *"
-  workflow_dispatch:
+# on:
+#  schedule:
+#    # Run at 15:00 and 15:05 UTC to absorb jitter; gate below keeps behavior exact
+#    - cron: "0,5 15 * * *"
+#  workflow_dispatch:
     inputs:
       DRY_RUN:
         description: "1 = no API writes"
